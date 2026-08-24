@@ -12,3 +12,9 @@ session_*
 PokemonRed.gb.state
 venv*
 .python-version
+
+# excluded: copyrighted ROM, not for a public repo
+Pokemon - Silberne Edition (Germany) (SGB Enhanced).zip
+
+# excluded: training checkpoint dump (942M, not source)
+v3_pokegym/runs_pokegym/

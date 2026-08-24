@@ -1,0 +1,12 @@
+# Verified working pin set on Apple Silicon (M4 Pro/Max), Python 3.11, macOS.
+# pyboy 1.6.14 is compiled against the NumPy 1.x C-ABI; numpy>=2 breaks it with
+# "numpy.dtype size changed" at import time. Do not upgrade numpy independently.
+numpy==1.26.4
+pyboy==1.6.14
+gymnasium==0.29.1
+scikit-image
+matplotlib
+mediapy
+stable-baselines3==2.3.2
+torch
+tensorboard
