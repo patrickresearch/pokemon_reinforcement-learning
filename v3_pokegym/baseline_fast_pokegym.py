@@ -1,32 +1,32 @@
 import multiprocessing
-# pokegym.environment.Base creates a multiprocessing.Manager() at class-body
-# (i.e. import) time. That only works with the 'fork' start method. macOS
-# defaults to 'spawn', which crashes with an unpicklable-closure error as
-# soon as SubprocVecEnv tries to hand env_fn to worker processes. Must be
-# set before pokegym (or anything importing it) is imported, and before
-# any Process/Pool is created.
-multiprocessing.set_start_method('fork', force=True)
 
+# pokegym.environment creates a multiprocessing.Manager at import time, which
+# only works with fork; macOS defaults to spawn.
+multiprocessing.set_start_method("fork", force=True)
+
+import argparse
+import json
+import subprocess
 import sys
+from dataclasses import asdict, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import gymnasium as gym
-from pokegym.environment import Environment
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+from stable_baselines3.common.logger import configure
 from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from pokegym_callback import RewardComponentCallback
+from pokegym.config import FIXES, EnvConfig
+from pokegym.environment import Environment
 from pokegym.rnd_wrapper import RNDRewardWrapper
+from pokegym_callback import RewardComponentCallback, RunLogCallback
 
 
-# pokegym.environment.Base implements the Gymnasium duck-type (reset/step/
-# action_space/observation_space) but does not actually subclass gymnasium.Env.
-# SB3 2.3.2's SubprocVecEnv worker does an isinstance(env, gymnasium.Env) check
-# and rejects it otherwise, so wrap it.
+# SB3's SubprocVecEnv worker requires a gymnasium.Env subclass.
 class GymnasiumEnvAdapter(gym.Env):
     def __init__(self, inner):
         self.inner = inner
@@ -46,44 +46,70 @@ class GymnasiumEnvAdapter(gym.Env):
         self.inner.close()
 
 
-# pokegym/pyboy_binding.py's make_env() currently hardcodes the ROM filename
-# to "pokemon_red.gb" relative to the working directory (it ignores the
-# rom_path argument entirely - see comment in pokegym/pyboy_binding.py).
-# Run this script with CWD = v3_pokegym/, which has pokemon_red.gb symlinked
-# to the real ROM in the parent directory.
-def make_env(rank, seed=0):
+def make_env(rank, cfg):
     def _init():
-        env = GymnasiumEnvAdapter(Environment(headless=True))
-        env.reset(seed=seed + rank)
-        return env
-    set_random_seed(seed)
+        return GymnasiumEnvAdapter(Environment(headless=True, config=replace(cfg, rank=rank)))
     return _init
 
 
+def git_state():
+    def run(*cmd):
+        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    return {"commit": run("git", "rev-parse", "HEAD"), "dirty": bool(run("git", "status", "--porcelain", "--", "."))}
+
+
 if __name__ == "__main__":
-    sess_path = Path("runs_pokegym")
-    sess_path.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num-envs", type=int, default=12)
+    parser.add_argument("--total-steps", type=int, default=100_000_000)
+    parser.add_argument("--save-freq", type=int, default=100_000)
+    parser.add_argument("--rnd-coef", type=float, default=0.5)
+    parser.add_argument("--device", default="mps")
+    parser.add_argument("--go-explore", choices=("latest", "legacy", "off"))
+    parser.add_argument("--loop-penalty", choices=("no_battle", "moves_only", "legacy", "off"))
+    parser.add_argument("--level-reward", choices=("trained", "legacy"))
+    parser.add_argument("--battle-reward", choices=("ko", "legacy"))
+    parser.add_argument("--team-reward", choices=("off", "legacy"))
+    parser.add_argument("--battle-obs", choices=("on", "off"))
+    preset = parser.add_mutually_exclusive_group()
+    preset.add_argument("--baseline", action="store_true")
+    preset.add_argument("--r1", action="store_true")
+    parser.add_argument("--ablate", action="append", choices=FIXES, default=[])
+    args = parser.parse_args()
 
-    num_cpu = 12  # leave a couple of the 14 M4 Pro cores for OS/main process
-    env = SubprocVecEnv([make_env(i) for i in range(num_cpu)])
-    env = RNDRewardWrapper(env, intrinsic_coef=0.5, device="cpu")
+    run_dir = Path("runs_pokegym") / args.name
+    run_dir.mkdir(parents=True)
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=20_000, save_path=sess_path, name_prefix="poke_pokegym"
-    )
-    callbacks = CallbackList([checkpoint_callback, RewardComponentCallback(log_freq=1000)])
+    cfg = EnvConfig.baseline() if args.baseline else EnvConfig.r1() if args.r1 else EnvConfig()
+    cfg = replace(cfg, run_dir=str(run_dir), **{name: False for name in args.ablate})
+    for name in ("go_explore", "loop_penalty", "level_reward", "battle_reward", "team_reward"):
+        if getattr(args, name):
+            cfg = replace(cfg, **{name: getattr(args, name)})
+    if args.battle_obs:
+        cfg = replace(cfg, battle_obs=args.battle_obs == "on")
 
-    model = PPO(
-        "MultiInputPolicy",  # observation_space is a Dict (screen + team_quality/gap scalars)
-        env,
-        verbose=1,
-        n_steps=2048,
-        batch_size=512,
-        n_epochs=3,
-        gamma=0.998,
-        ent_coef=0.01,
-        device="cpu",  # no CUDA on Apple Silicon; try "mps" once this is confirmed stable
-        tensorboard_log=sess_path,
-    )
+    ppo_kwargs = dict(n_steps=2048, batch_size=512, n_epochs=3, gamma=0.998, ent_coef=0.01, device=args.device)
+    (run_dir / "config.json").write_text(json.dumps(
+        {"args": vars(args), "env": asdict(cfg), "ppo": ppo_kwargs, "git": git_state()}, indent=2
+    ))
 
-    model.learn(total_timesteps=100_000_000, callback=callbacks, tb_log_name="poke_pokegym_ppo")
+    set_random_seed(args.seed)
+    env = SubprocVecEnv([make_env(i, cfg) for i in range(args.num_envs)])
+    if args.rnd_coef > 0:
+        env = RNDRewardWrapper(env, intrinsic_coef=args.rnd_coef, device="cpu")
+
+    model = PPO("MultiInputPolicy", env, verbose=1, seed=args.seed, **ppo_kwargs)
+    model.set_logger(configure(str(run_dir), ["stdout", "csv", "tensorboard"]))
+
+    callbacks = CallbackList([
+        CheckpointCallback(save_freq=args.save_freq, save_path=run_dir / "checkpoints", name_prefix="poke"),
+        RewardComponentCallback(log_freq=1000),
+        RunLogCallback(run_dir),
+    ])
+    try:
+        model.learn(total_timesteps=args.total_steps, callback=callbacks)
+    finally:
+        model.save(run_dir / "checkpoints" / "poke_final")
+        env.close()

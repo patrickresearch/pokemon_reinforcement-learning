@@ -10,3 +10,4 @@ mediapy
 stable-baselines3==2.3.2
 torch
 tensorboard
+pytest
