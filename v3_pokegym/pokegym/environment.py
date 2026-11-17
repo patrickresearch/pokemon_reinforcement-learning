@@ -1108,7 +1108,9 @@ class Environment(Base):
         if self.cfg.battle_reward == "ko":
             if game_state.enemy_fainted(self.prev_enemy, enemy):
                 self.ko_count += 1
-                battle_win_bonus = 2 * challenge_ratio(enemy[3], avg_team_level)
+                # Wild KOs pay only through trained levels; a per-KO bonus there is farmable.
+                if battle_flag == 2:
+                    battle_win_bonus = 2 * challenge_ratio(enemy[3], avg_team_level)
         elif self.prev_battle_flag > 0 and battle_flag == 0 and not party_all_fainted:
             opp_level = getattr(self, "current_battle_max_opponent_level", 0)
             battle_win_bonus = 2 * challenge_ratio(opp_level, avg_team_level)
