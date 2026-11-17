@@ -37,6 +37,12 @@ def move(move_name: str) -> dict | None:
     return _load()["moves"].get(move_name)
 
 
+def move_by_id(move_id: int) -> dict | None:
+    if "move_ids" not in _load():
+        raise KeyError(f"{_CACHE_PATH} has no move_ids - run `python scripts/build_pokedex_cache.py --move-ids`.")
+    return _raw["move_ids"].get(str(move_id))
+
+
 def type_chart() -> dict:
     """Gen 1 type-effectiveness relations, keyed by attacking type name."""
     return _load()["type_chart"]

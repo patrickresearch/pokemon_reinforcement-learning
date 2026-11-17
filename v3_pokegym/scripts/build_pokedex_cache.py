@@ -128,7 +128,38 @@ def build_species_cache() -> dict:
     return species_cache, move_cache
 
 
+GEN1_MOVE_COUNT = 165
+
+
+def version_group_id(entry):
+    return int(entry["version_group"]["url"].rstrip("/").split("/")[-1])
+
+
+def gen1_value(move_data, field):
+    # past_values holds superseded values; the oldest non-null one is the Gen 1 value.
+    for past in sorted(move_data.get("past_values", []), key=version_group_id):
+        if past.get(field) is not None:
+            return past[field]["name"] if field == "type" else past[field]
+    current = move_data[field]
+    return current["name"] if field == "type" else current
+
+
+def build_move_ids() -> dict:
+    move_ids = {}
+    for move_id in range(1, GEN1_MOVE_COUNT + 1):
+        data = fetch_json(f"{API_BASE}/move/{move_id}")
+        time.sleep(REQUEST_DELAY_S)
+        move_ids[str(move_id)] = {"name": data["name"], "type": gen1_value(data, "type"), "power": gen1_value(data, "power")}
+    return move_ids
+
+
 def main():
+    if "--move-ids" in sys.argv:
+        payload = json.loads(OUT_PATH.read_text())
+        payload["move_ids"] = build_move_ids()
+        OUT_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(f"Wrote {len(payload['move_ids'])} move ids to {OUT_PATH}")
+        return
     OUT_PATH.parent.mkdir(exist_ok=True)
     print("Fetching Gen 1 type effectiveness chart...")
     type_chart = build_type_chart()
@@ -141,6 +172,7 @@ def main():
         "type_chart": type_chart,
         "species": species_cache,
         "moves": move_cache,
+        "move_ids": build_move_ids(),
     }
     OUT_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
     print(f"\nWrote {OUT_PATH} ({len(species_cache)} species, {len(move_cache)} moves, {len(type_chart)} types)")

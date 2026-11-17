@@ -22,7 +22,8 @@ from pokegym.pyboy_binding import (
     load_pyboy_state,
     run_action_on_emulator,
 )
-from . import ram_map, game_map, data, ram_map_leanke, team_optimizer
+from . import ram_map, game_map, data, ram_map_leanke, team_optimizer, game_state
+from .config import EnvConfig
 import subprocess
 import multiprocessing
 import time
@@ -79,6 +80,18 @@ LOOP_PENALTY_THRESHOLD = 20
 GO_EXPLORE_CELL_SIZE = 4
 GO_EXPLORE_STUCK_THRESHOLD = 2000
 GO_EXPLORE_MAX_ARCHIVE_CELLS = 500
+GO_EXPLORE_REFRESH_STEPS = 256
+
+TRAJ_FLUSH_BYTES = 3072
+
+def taper(x, knee=50):
+    return x if x < knee else knee + (x - knee) / 4
+
+
+def challenge_ratio(opp_level, avg_team_level):
+    # Clamped so a single lopsided matchup cannot dominate the return.
+    return min(max(max(opp_level, 1) / max(avg_team_level, 1), 0.2), 3.0)
+
 
 class Base:
     # Shared counter among processes
@@ -402,9 +415,30 @@ class Environment(Base):
         save_video=False,
         quiet=False,
         verbose=False,
+        config=None,
         **kwargs,
     ):
         super().__init__(rom_path, state_path, headless, save_video, quiet, **kwargs)
+        self.cfg = config or EnvConfig()
+        if self.cfg.battle_obs:
+            self.observation_space = spaces.Dict({
+                **self.observation_space.spaces,
+                "battle": spaces.Box(low=0, high=1, shape=(game_state.BATTLE_FEATURES,), dtype=np.float32),
+            })
+        self.catch_levels = {}
+        self.ko_count = 0
+        self.box_stride, self.box_level_offset = (33, 0x03) if self.cfg.fix_box_struct else (200, 0x21)
+        self.total_steps = 0
+        self.milestones = set()
+        self.milestone_state = None
+        self.pending_jump = None
+        self.prev_cell_key = None
+        self.traj = bytearray()
+        self.traj_path = None
+        if self.cfg.run_dir and self.cfg.traj_stride:
+            traj_dir = Path(self.cfg.run_dir) / "traj"
+            traj_dir.mkdir(parents=True, exist_ok=True)
+            self.traj_path = traj_dir / f"env{self.cfg.rank}.u8"
         self.counts_map = np.zeros((444, 436))
         # These persist for the lifetime of this worker process, like
         # counts_map above - reset() only clears them on the very first call
@@ -508,10 +542,8 @@ class Environment(Base):
                         if move_id == 15:
                             self.cut = 1
         # Scan current box (since the box doesn't auto increment in pokemon red)
-        num_moves = 4
-        box_struct_length = 25 * num_moves * 2
         for i in range(self.game.get_memory_value(0xda80)):
-            offset = i*box_struct_length + 0xda96
+            offset = i*self.box_stride + 0xda96
             if self.game.get_memory_value(offset) != 0:
                 for j in range(4):
                     move_id = self.game.get_memory_value(offset + j + 8)
@@ -520,25 +552,18 @@ class Environment(Base):
 
     def get_box_pokemon(self):
         """Species+level for every Pokémon currently sitting in the PC box
-        (does not include the active party). Reuses the same base address and
-        stride already established by update_moves_obtained() above for this
-        box scan. NOTE: the level offset here mirrors the party struct's
-        POKE->LEVEL offset (+0x21) for internal consistency with how this
-        codebase already reads box entries (moves via the party-style +8
-        offset) - this has not been empirically verified against a live save
-        with boxed Pokémon and should be spot-checked once the training run
-        has actually deposited something, before Phase 3 relies on it.
+        (does not include the active party). pokered box_struct is 33 bytes
+        with the level at +3; the legacy stride/offset (200, +0x21) is kept
+        behind cfg.fix_box_struct for the baseline run only.
         """
-        num_moves = 4
-        box_struct_length = 25 * num_moves * 2
         box_mons = []
         for i in range(self.game.get_memory_value(0xda80)):
-            offset = i * box_struct_length + 0xda96
+            offset = i * self.box_stride + 0xda96
             species = self.game.get_memory_value(offset)
             if species != 0:
                 box_mons.append({
                     "species": species,
-                    "level": self.game.get_memory_value(offset + 0x21),
+                    "level": self.game.get_memory_value(offset + self.box_level_offset),
                 })
         return box_mons
     def get_items_in_bag(self, one_indexed=0):
@@ -680,8 +705,46 @@ class Environment(Base):
         if should_reward:
             self.rewarded_coords.add(new_position)
 
-    def reset(self, seed=None, options=None, max_episode_steps=20480, reward_scale=4.0):
+    def _get_obs(self):
+        obs = super()._get_obs()
+        if self.cfg.battle_obs:
+            obs["battle"] = game_state.battle_features(self.game)
+        return obs
+
+    def flush_traj(self):
+        if self.traj_path is not None and self.traj:
+            with open(self.traj_path, "ab") as f:
+                f.write(self.traj)
+            self.traj.clear()
+
+    def close(self):
+        self.flush_traj()
+        super().close()
+
+    def new_milestones(self, badges, map_n, party_size, max_level, bill_state, hm_count):
+        state = (badges, map_n, party_size, int(self.caught_pokemon.sum()), max_level // 5, bill_state, hm_count, self.cut)
+        if state == self.milestone_state:
+            return []
+        self.milestone_state = state
+        names = [f"map_{map_n}", f"party_{party_size}", f"caught_{state[3]}"]
+        if badges:
+            names.append(f"badge_{badges}")
+        if state[4]:
+            names.append(f"maxlevel_{state[4] * 5}")
+        if bill_state:
+            names.append("bill_saved")
+        if hm_count:
+            names.append(f"hm_{hm_count}")
+        if self.cut:
+            names.append("cut_taught")
+        new = [n for n in names if n not in self.milestones]
+        self.milestones.update(new)
+        return [(n, self.total_steps) for n in new]
+
+    def reset(self, seed=None, options=None, max_episode_steps=None, reward_scale=4.0):
         """Resets the game. Seeding is NOT supported"""
+        if max_episode_steps is None:
+            max_episode_steps = self.cfg.max_episode_steps
         if self.reset_count == 0:
             load_pyboy_state(self.game, self.load_first_state())
             # Only clear on the one call where the emulator itself is also
@@ -695,6 +758,11 @@ class Environment(Base):
                 self.screen_memory = defaultdict(
                     lambda: np.zeros((255, 255, 1), dtype=np.uint8)
                 )
+
+        if self.pending_jump is not None:
+            load_pyboy_state(self.game, self.pending_jump)
+            self.pending_jump = None
+            self.go_explore_reset_count += 1
 
         if self.save_video:
             base_dir = self.s_path
@@ -712,6 +780,7 @@ class Environment(Base):
         self.init_hidden_obj_mem()
         self.max_events = 0
         self.max_level_sum = 0
+        self.max_trained_levels = 0
         self.max_opponent_level = 0
         self.death_count_per_episode = 0
         self.total_healing = 0
@@ -736,10 +805,14 @@ class Environment(Base):
         self.moves_obtained = np.zeros(0xA5, dtype=np.uint8)
         self.party_stats = ram_map.party_stats(self.game)
         self.box_pokemon = self.get_box_pokemon()
+        if self.cfg.fix_catch_refarm:
+            self.update_pokedex()
         self.newly_caught_species = 0
         self.prev_party_levels = [s["level"] for s in self.party_stats]
         self.prev_battle_flag = 0
+        self.prev_enemy = game_state.enemy_snapshot(self.game)
         self.current_battle_max_opponent_level = 0
+        self.team_signature = None
         self.team_quality = team_optimizer.current_team_score(self.party_stats, ram_map.badges(self.game))
         self.team_quality_gap_value = team_optimizer.team_quality_gap(
             self.party_stats, self.box_pokemon, ram_map.badges(self.game)
@@ -779,12 +852,17 @@ class Environment(Base):
     def step(self, action, fast_video=True):
         run_action_on_emulator(self.game, self.screen, ACTIONS[action], self.headless, fast_video=fast_video,)
         self.time += 1
+        self.total_steps += 1
         
         if self.save_video:
             self.add_video_frame()
         
         # Exploration reward
         r, c, map_n = ram_map.position(self.game)
+        if self.traj_path is not None and self.total_steps % self.cfg.traj_stride == 0:
+            self.traj.extend((r & 255, c & 255, map_n & 255))
+            if len(self.traj) >= TRAJ_FLUSH_BYTES:
+                self.flush_traj()
         coord_is_new = (r, c, map_n) not in self.seen_coords
         self.seen_coords.add((r, c, map_n))
 
@@ -793,9 +871,15 @@ class Environment(Base):
         # to hubs like the Pokemon Center over a full playthrough) - only
         # looks at a small recent window, so it fades on its own as the
         # agent moves on and doesn't need any manual reset.
-        self.recent_positions.append((r, c, map_n))
-        recent_visit_count = self.recent_positions.count((r, c, map_n))
-        loop_penalty = -0.02 * max(0, recent_visit_count - LOOP_PENALTY_THRESHOLD)
+        # Battles and dialogs keep the player on one tile for hundreds of
+        # steps; counting those makes a gym fight cost more than its badge pays.
+        loop_penalty = 0
+        mode = self.cfg.loop_penalty
+        in_battle = ram_map.mem_val(self.game, 0xD057) != 0
+        if mode == "legacy" or (mode == "no_battle" and not in_battle) or (mode == "moves_only" and not in_battle and action < 4):
+            self.recent_positions.append((r, c, map_n))
+            recent_visit_count = self.recent_positions.count((r, c, map_n))
+            loop_penalty = -0.02 * max(0, recent_visit_count - LOOP_PENALTY_THRESHOLD)
 
         # BET ADDED TREE REWARDS
         glob_r, glob_c = game_map.local_to_global(r, c, map_n)
@@ -808,19 +892,32 @@ class Environment(Base):
         # in counts_map, i.e. a spot that's reachable but still
         # under-explored, instead of continuing to flail from a dead end.
         cell_key = (map_n, r // GO_EXPLORE_CELL_SIZE, c // GO_EXPLORE_CELL_SIZE)
+        go_explore = self.cfg.go_explore
         if coord_is_new:
             self.steps_since_new_coord = 0
-            if cell_key not in self.go_explore_archive and len(self.go_explore_archive) < GO_EXPLORE_MAX_ARCHIVE_CELLS:
-                snapshot = io.BytesIO()
-                self.game.save_state(snapshot)
-                self.go_explore_archive[cell_key] = (snapshot, glob_r, glob_c)
         else:
             self.steps_since_new_coord += 1
 
-        if self.steps_since_new_coord > GO_EXPLORE_STUCK_THRESHOLD:
+        if go_explore == "legacy":
+            if coord_is_new and cell_key not in self.go_explore_archive and len(self.go_explore_archive) < GO_EXPLORE_MAX_ARCHIVE_CELLS:
+                snapshot = io.BytesIO()
+                self.game.save_state(snapshot)
+                self.go_explore_archive[cell_key] = (snapshot, glob_r, glob_c, self.total_steps)
+        elif go_explore == "latest" and cell_key != self.prev_cell_key and ram_map.mem_val(self.game, 0xD057) == 0:
+            # Refreshing on re-entry keeps a later jump from rolling game
+            # progress back to the first visit of the cell.
+            entry = self.go_explore_archive.get(cell_key)
+            stale = entry is not None and self.total_steps - entry[3] >= GO_EXPLORE_REFRESH_STEPS
+            if stale or (entry is None and len(self.go_explore_archive) < GO_EXPLORE_MAX_ARCHIVE_CELLS):
+                snapshot = io.BytesIO()
+                self.game.save_state(snapshot)
+                self.go_explore_archive[cell_key] = (snapshot, glob_r, glob_c, self.total_steps)
+        self.prev_cell_key = cell_key
+
+        if go_explore != "off" and self.steps_since_new_coord > GO_EXPLORE_STUCK_THRESHOLD:
             same_map_cells = [
-                (key, snap, gr, gc) for key, (snap, gr, gc) in self.go_explore_archive.items()
-                if key[0] == map_n
+                (key, snap, gr, gc) for key, (snap, gr, gc, _) in self.go_explore_archive.items()
+                if key[0] == map_n and (go_explore == "legacy" or key != cell_key)
             ]
             if same_map_cells:
                 def visit_count(entry):
@@ -830,11 +927,13 @@ class Environment(Base):
                     except IndexError:
                         return 0
                 _, chosen_snapshot, _, _ = min(same_map_cells, key=visit_count)
-                load_pyboy_state(self.game, chosen_snapshot)
-                self.go_explore_reset_count += 1
-                # r/c/map_n/glob_r/glob_c below are now stale for the rest of
-                # this one step (read before the jump) - harmless, the very
-                # next step reads a fresh position from RAM.
+                if go_explore == "legacy":
+                    load_pyboy_state(self.game, chosen_snapshot)
+                    self.go_explore_reset_count += 1
+                else:
+                    # Loaded in reset() so the step returns the pre-jump
+                    # observation and the rollout sees a truncation there.
+                    self.pending_jump = chosen_snapshot
             self.steps_since_new_coord = 0
 
         if self.cut:
@@ -863,10 +962,12 @@ class Environment(Base):
         # Level reward
         party_size, party_levels = ram_map.party(self.game)
         self.max_level_sum = max(self.max_level_sum, sum(party_levels))
-        if self.max_level_sum < 50: # 30
-            level_reward = 1 * self.max_level_sum
+        if self.cfg.level_reward == "trained":
+            trained = game_state.trained_levels(self.game, self.catch_levels)
+            self.max_trained_levels = max(self.max_trained_levels, trained)
+            level_reward = 2 * taper(self.max_trained_levels)
         else:
-            level_reward = 50 + (self.max_level_sum - 50) / 4 # 30
+            level_reward = taper(self.max_level_sum)
             
         # Healing and death rewards
         hp = ram_map.hp(self.game)
@@ -1002,24 +1103,29 @@ class Environment(Base):
             )
         party_all_fainted = len(self.party_stats) > 0 and all(s["hp"] == 0 for s in self.party_stats)
         battle_win_bonus = 0
-        if self.prev_battle_flag > 0 and battle_flag == 0 and not party_all_fainted:
-            avg_team_level = (sum(current_levels) / len(current_levels)) if current_levels else 1
-            opp_level = max(getattr(self, "current_battle_max_opponent_level", 0), 1)
-            # Reward roughly challenging fights more than trivial grinding;
-            # clamp so a single very lopsided matchup can't dominate reward.
-            challenge_ratio = min(max(opp_level / max(avg_team_level, 1), 0.2), 3.0)
-            battle_win_bonus = challenge_ratio * 2
+        avg_team_level = (sum(current_levels) / len(current_levels)) if current_levels else 1
+        enemy = game_state.enemy_snapshot(self.game)
+        if self.cfg.battle_reward == "ko":
+            if game_state.enemy_fainted(self.prev_enemy, enemy):
+                self.ko_count += 1
+                battle_win_bonus = 2 * challenge_ratio(enemy[3], avg_team_level)
+        elif self.prev_battle_flag > 0 and battle_flag == 0 and not party_all_fainted:
+            opp_level = getattr(self, "current_battle_max_opponent_level", 0)
+            battle_win_bonus = 2 * challenge_ratio(opp_level, avg_team_level)
+        self.prev_enemy = enemy
         self.prev_battle_flag = battle_flag
 
         # Team-quality score: exhaustive combinatorics over the full
         # party+box pool, so only recomputed right after a catch or every
         # 500 steps rather than every single step.
-        if self.newly_caught_species > 0 or self.time % 500 == 0:
+        signature = (tuple((s["species"], s["level"]) for s in self.party_stats), len(self.box_pokemon), badges)
+        if signature != self.team_signature or self.newly_caught_species > 0 or self.time % 500 == 0:
+            self.team_signature = signature
             self.team_quality = team_optimizer.current_team_score(self.party_stats, badges)
             self.team_quality_gap_value = team_optimizer.team_quality_gap(
                 self.party_stats, self.box_pokemon, badges
             )
-        team_quality_reward = self.reward_scale * 0.02 * self.team_quality
+        team_quality_reward = self.reward_scale * 0.02 * self.team_quality if self.cfg.team_reward == "legacy" else 0
 
         bill_capt_rew = ram_map.bill_capt(self.game)
         
@@ -1120,7 +1226,10 @@ class Environment(Base):
         }
 
         info = {"reward_components": self.last_reward_components}
-        done = self.time >= self.max_episode_steps
+        milestones = self.new_milestones(badges, map_n, party_size, max(party_levels, default=0), bill_state, hm_count)
+        if milestones:
+            info["milestones"] = milestones
+        done = self.time >= self.max_episode_steps or self.pending_jump is not None
 
 
         if self.save_video and done:
@@ -1128,7 +1237,7 @@ class Environment(Base):
         
         # if done:
         #     self.save_state()
-        if done or self.time % 10000 == 0:
+        if done or self.total_steps % 10000 == 0:
             levels = [self.game.get_memory_value(a) for a in [0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268]]
             info["stats"] = {
                     "step": self.time,
@@ -1177,8 +1286,12 @@ class Environment(Base):
                     # 'rewards': int(self.total_reward) if self.total_reward is not None else 0,
                     "maps_explored": len(self.seen_maps),
                     "party_size": party_size,
-                    "highest_pokemon_level": max(party_levels),
+                    "highest_pokemon_level": max(party_levels, default=0),
+                    "env_total_steps": self.total_steps,
+                    "go_explore_resets": self.go_explore_reset_count,
                     "total_party_level": sum(party_levels),
+                    "trained_levels": self.max_trained_levels,
+                    "kos": self.ko_count,
                     "deaths": self.death_count,
                     # "ss_anne_obtained": ss_anne_obtained,
                     "event": events,
@@ -1195,7 +1308,6 @@ class Environment(Base):
                     "badge_1": float(badges >= 1),
                     "badge_2": float(badges >= 2),
                     "badge_3": float(badges >= 3),
-                    "maps_explored": np.sum(self.seen_maps),
                     "party_size": party_size,
                     "bill_capt": (bill_capt_rew/5),
                     'cut_coords': cut_coords,
@@ -1232,4 +1344,4 @@ class Environment(Base):
             }
             info["pokemon_exploration_map"] = self.counts_map # self.explore_map, #  self.counts_map,
 
-        return self._get_obs(), reward, done, done, info
+        return self._get_obs(), reward, done and not self.cfg.truncate_time_limit, done, info
