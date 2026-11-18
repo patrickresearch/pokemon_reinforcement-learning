@@ -72,7 +72,9 @@ def test_trajectory_is_flushed_on_close(tmp_path):
     for _ in range(10):
         env.step(B_BUTTON)
     env.close()
-    assert (tmp_path / "traj" / "env3.u8").stat().st_size == 15
+    data = (tmp_path / "traj" / "env3.u8").read_bytes()
+    assert len(data) == 20
+    assert all(b >> 2 == B_BUTTON for b in data[3::4])
 
 
 def test_fixed_time_limit_truncates_without_refarm():
@@ -88,3 +90,15 @@ def test_baseline_reproduces_catch_refarm():
     terminated, truncated, _, catch_bonus = run_over_time_limit(cfg)
     assert terminated and truncated
     assert catch_bonus > 0
+
+
+def test_frontier_prefers_unused_then_newest_cells_on_any_map():
+    from pokegym.environment import frontier_target
+    archive = {
+        (12, 0, 0): (None, 0, 0, 0, 100, 0),
+        (51, 2, 3): (None, 0, 0, 0, 900, 0),
+        (51, 2, 4): (None, 0, 0, 0, 950, 1),
+    }
+    assert frontier_target(archive, (12, 0, 0)) == (51, 2, 3)
+    assert frontier_target(archive, (51, 2, 3)) == (12, 0, 0)
+    assert frontier_target({(12, 0, 0): archive[(12, 0, 0)]}, (12, 0, 0)) is None

@@ -1,7 +1,7 @@
 import numpy as np
 
 from . import pokedex_cache
-from .gen1_data import GEN1_TYPE_ID_TO_NAME
+from .gen1_data import GEN1_TYPE_ID_TO_NAME, NEXT_TRAINER_BY_BADGE_COUNT
 
 PARTY_COUNT = 0xD163
 PARTY_BASE = 0xD16B
@@ -20,6 +20,7 @@ PLAYER_MAX_HP = 0xD023
 PLAYER_PP = 0xD02D
 MAX_MOVE_POWER = 200
 BATTLE_FEATURES = 1 + 4 * 4 + 2 + 4
+LEVEL_CAP_MARGIN = 5
 
 
 def u16(game, addr):
@@ -35,8 +36,19 @@ def party_identities(game):
     return mons
 
 
-def trained_levels(game, catch_levels):
-    return sum(level - catch_levels.setdefault(key, level) for key, level in party_identities(game))
+def level_cap(badges):
+    trainer = NEXT_TRAINER_BY_BADGE_COUNT.get(badges)
+    return None if trainer is None else max(level for _, level in trainer["team"]) + LEVEL_CAP_MARGIN
+
+
+def trained_levels(game, catch_levels, cap=None):
+    total = 0
+    for key, level in party_identities(game):
+        start = catch_levels.setdefault(key, level)
+        if cap is not None:
+            level, start = min(level, cap), min(start, cap)
+        total += level - start
+    return total
 
 
 def type_names(game, addrs):

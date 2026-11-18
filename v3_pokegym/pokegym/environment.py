@@ -88,6 +88,12 @@ def taper(x, knee=50):
     return x if x < knee else knee + (x - knee) / 4
 
 
+def frontier_target(archive, current):
+    # Least-used target first, newest discovery breaks ties: jumps go to the frontier, any map.
+    candidates = [k for k in archive if k != current]
+    return min(candidates, key=lambda k: (archive[k][5], -archive[k][4])) if candidates else None
+
+
 def challenge_ratio(opp_level, avg_team_level):
     # Clamped so a single lopsided matchup cannot dominate the return.
     return min(max(max(opp_level, 1) / max(avg_team_level, 1), 0.2), 3.0)
@@ -860,7 +866,8 @@ class Environment(Base):
         # Exploration reward
         r, c, map_n = ram_map.position(self.game)
         if self.traj_path is not None and self.total_steps % self.cfg.traj_stride == 0:
-            self.traj.extend((r & 255, c & 255, map_n & 255))
+            battle = ram_map.mem_val(self.game, 0xD057) & 3
+            self.traj.extend((r & 255, c & 255, map_n & 255, battle | (action & 7) << 2))
             if len(self.traj) >= TRAJ_FLUSH_BYTES:
                 self.flush_traj()
         coord_is_new = (r, c, map_n) not in self.seen_coords
@@ -903,6 +910,16 @@ class Environment(Base):
                 snapshot = io.BytesIO()
                 self.game.save_state(snapshot)
                 self.go_explore_archive[cell_key] = (snapshot, glob_r, glob_c, self.total_steps)
+        elif go_explore == "frontier" and cell_key != self.prev_cell_key and not in_battle:
+            entry = self.go_explore_archive.get(cell_key)
+            if entry is None or self.total_steps - entry[3] >= GO_EXPLORE_REFRESH_STEPS:
+                archive = self.go_explore_archive
+                if entry is None and len(archive) >= GO_EXPLORE_MAX_ARCHIVE_CELLS:
+                    del archive[min(archive, key=lambda k: archive[k][4])]
+                snapshot = io.BytesIO()
+                self.game.save_state(snapshot)
+                discovered, jumps = (self.total_steps, 0) if entry is None else entry[4:]
+                archive[cell_key] = (snapshot, glob_r, glob_c, self.total_steps, discovered, jumps)
         elif go_explore == "latest" and cell_key != self.prev_cell_key and ram_map.mem_val(self.game, 0xD057) == 0:
             # Refreshing on re-entry keeps a later jump from rolling game
             # progress back to the first visit of the cell.
@@ -914,7 +931,15 @@ class Environment(Base):
                 self.go_explore_archive[cell_key] = (snapshot, glob_r, glob_c, self.total_steps)
         self.prev_cell_key = cell_key
 
-        if go_explore != "off" and self.steps_since_new_coord > GO_EXPLORE_STUCK_THRESHOLD:
+        if go_explore == "frontier":
+            if self.steps_since_new_coord > GO_EXPLORE_STUCK_THRESHOLD and not in_battle:
+                target = frontier_target(self.go_explore_archive, cell_key)
+                if target is not None:
+                    snap, gr, gc, saved, discovered, jumps = self.go_explore_archive[target]
+                    self.go_explore_archive[target] = (snap, gr, gc, saved, discovered, jumps + 1)
+                    self.pending_jump = snap
+                self.steps_since_new_coord = 0
+        elif go_explore != "off" and self.steps_since_new_coord > GO_EXPLORE_STUCK_THRESHOLD:
             same_map_cells = [
                 (key, snap, gr, gc) for key, (snap, gr, gc, _) in self.go_explore_archive.items()
                 if key[0] == map_n and (go_explore == "legacy" or key != cell_key)
@@ -962,8 +987,10 @@ class Environment(Base):
         # Level reward
         party_size, party_levels = ram_map.party(self.game)
         self.max_level_sum = max(self.max_level_sum, sum(party_levels))
-        if self.cfg.level_reward == "trained":
-            trained = game_state.trained_levels(self.game, self.catch_levels)
+        if self.cfg.level_reward in ("trained", "capped"):
+            # Levels beyond the next gym leader's only pay out once that badge is won.
+            cap = game_state.level_cap(ram_map.badges(self.game)) if self.cfg.level_reward == "capped" else None
+            trained = game_state.trained_levels(self.game, self.catch_levels, cap)
             self.max_trained_levels = max(self.max_trained_levels, trained)
             level_reward = 2 * taper(self.max_trained_levels)
         else:

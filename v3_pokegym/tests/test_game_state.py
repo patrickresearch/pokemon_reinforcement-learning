@@ -40,6 +40,16 @@ def test_trained_levels_ignore_catches_and_survive_reordering():
     assert gs.trained_levels(party((1, 0x2222, 4), (1, 0xABCD, 8), (1, 0x1111, 5)), catch_levels) == 5
 
 
+def test_capped_levels_stop_at_cap_and_unlock_with_badges():
+    assert gs.level_cap(0) == 19 and gs.level_cap(1) == 26 and gs.level_cap(8) is None
+    catch_levels = {}
+    gs.trained_levels(party((1, 0xABCD, 6), (1, 0x1111, 20)), catch_levels)
+    game = party((1, 0xABCD, 30), (1, 0x1111, 25))
+    assert gs.trained_levels(game, catch_levels, cap=16) == 10
+    assert gs.trained_levels(game, catch_levels, cap=23) == 17 + 3
+    assert gs.trained_levels(game, catch_levels) == 24 + 5
+
+
 def battle(moves, pp=(10, 10, 10, 10), menu=0):
     mem = {gs.BATTLE_FLAG: 1, gs.PLAYER_TYPES[0]: WATER, gs.PLAYER_TYPES[1]: WATER,
            gs.ENEMY_TYPES[0]: FIRE, gs.ENEMY_TYPES[1]: FIRE, gs.MENU_ITEM: menu,

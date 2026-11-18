@@ -10,7 +10,7 @@ class EnvConfig:
     fix_box_struct: bool = True
     go_explore: str = "latest"
     loop_penalty: str = "no_battle"
-    level_reward: str = "trained"
+    level_reward: str = "capped"
     battle_reward: str = "ko"
     team_reward: str = "off"
     battle_obs: bool = True
